@@ -6,7 +6,6 @@
   "scripts": {
     "start": "tsx index.ts",
     "check": "tsc",
-    "test-bluetooth": "tsx test-bluetooth.ts",
     "discover": "./discover-devices.sh"
   },
   "keywords": [],

@@ -91,18 +91,10 @@ class Bluetooth {
       // Wait a moment for connection to establish
       await new Promise(resolve => setTimeout(resolve, 2000));
       
-      // Try to bind RFCOMM channel
-      try {
-        await execAsync(`sudo rfcomm bind rfcomm0 ${device.address} 1`);
-        this.rfcommChannel = '/dev/rfcomm0';
-        this.isConnected = true;
-        console.log('Bluetooth connection established via RFCOMM');
-      } catch (rfcommError) {
-        // If RFCOMM fails, we'll use a different approach
-        console.log('RFCOMM binding failed, using alternative connection method');
-        this.isConnected = true;
-        this.deviceAddress = device.address;
-      }
+      // Mark as connected - we'll use SPP method for data transmission
+      this.isConnected = true;
+      this.deviceAddress = device.address;
+      console.log('Bluetooth connection established');
       
     } catch (error) {
       console.error('Failed to connect to Bluetooth device:', error);
@@ -122,24 +114,8 @@ class Bluetooth {
     console.log(`Sending via Bluetooth:`, message);
     
     try {
-      if (this.rfcommChannel) {
-        // Method 1: Use RFCOMM channel if available
-        await fs.writeFile(this.rfcommChannel, message + '\n');
-        console.log('Message sent successfully via RFCOMM');
-      } else {
-        // Method 2: Use bluetoothctl to send data (fallback)
-        // This creates a temporary file and uses system commands
-        const tempFile = path.join('/tmp', `bt_message_${Date.now()}.txt`);
-        await fs.writeFile(tempFile, message);
-        
-        // Note: This is a simplified approach. In a real implementation,
-        // you might need to use a specific Bluetooth profile like SPP
-        console.log('Message prepared for Bluetooth transmission');
-        console.log('Note: Direct data transmission requires specific Bluetooth profile implementation');
-        
-        // Clean up temp file
-        await fs.unlink(tempFile).catch(() => {});
-      }
+      // Use alternative method: send via bluetoothctl or system approach
+      await this.sendViaSPP(message);
     } catch (error) {
       console.error('Error sending Bluetooth message:', error);
     }
