@@ -1,180 +1,96 @@
 import { spawn, exec } from 'child_process';
-import { promisify } from 'util';
-import * as fs from 'fs/promises';
-import * as path from 'path';
+import * as fs from 'fs';
 
-const execAsync = promisify(exec);
+export class Bluetooth {
+  private deviceAddress = process.env.BLUETOOTH_DEVICE_ADDRESS || '';
+  private rfcommProc: ReturnType<typeof spawn> | null = null;
+  private rfcommFd: number | null = null;
 
-interface BluetoothDevice {
-  address: string;
-  name: string;
-  paired: boolean;
-}
-
-class Bluetooth {
-  private deviceAddress: string = process.env.BLUETOOTH_DEVICE_ADDRESS || '';
-  private deviceName: string = process.env.BLUETOOTH_DEVICE_NAME || '';
-  private isConnected: boolean = false;
-  private rfcommChannel: string = '';
-  private rfcommProcess: any = null;
-
-  constructor() {
-    // Constructor setup if needed
-  }
-
-  /**
-   * Discover paired Bluetooth devices
-   */
-  async discoverPairedDevices(): Promise<BluetoothDevice[]> {
-    try {
-      console.log('Discovering paired Bluetooth devices...');
-      const { stdout } = await execAsync('bluetoothctl devices Paired');
-      
-      const devices: BluetoothDevice[] = [];
-      const lines = stdout.split('\n').filter(line => line.trim());
-      
-      for (const line of lines) {
-        const match = line.match(/Device ([A-Fa-f0-9:]{17}) (.+)/);
-        if (match) {
-          devices.push({
-            address: match[1],
-            name: match[2],
-            paired: true
-          });
-        }
-      }
-      
-      console.log('Found paired devices:', devices);
-      return devices;
-    } catch (error) {
-      console.error('Error discovering devices:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Find device by name or address
-   */
-  private async findDevice(nameOrAddress: string): Promise<BluetoothDevice | null> {
-    const devices = await this.discoverPairedDevices();
-    return devices.find(device => 
-      device.name.toLowerCase().includes(nameOrAddress.toLowerCase()) || 
-      device.address === nameOrAddress
-    ) || null;
-  }
-
-  /**
-   * Connect to a Bluetooth device using RFCOMM
-   */
   async startConnection(deviceIdentifier?: string): Promise<void> {
-    try {
-      const identifier = deviceIdentifier || this.deviceAddress || this.deviceName;
-      
-      if (!identifier) {
-        throw new Error('Device address or name is required. Set BLUETOOTH_DEVICE_ADDRESS or BLUETOOTH_DEVICE_NAME environment variable.');
-      }
-
-      // Find the device
-      const device = await this.findDevice(identifier);
-      if (!device) {
-        console.log('Available paired devices:');
-        const devices = await this.discoverPairedDevices();
-        devices.forEach(d => console.log(`  ${d.name} (${d.address})`));
-        throw new Error(`Device not found: ${identifier}. Make sure the device is paired.`);
-      }
-
-      console.log(`Connecting to Bluetooth device: ${device.name} (${device.address})`);
-      
-      // Try to connect using bluetoothctl
-      await execAsync(`bluetoothctl connect ${device.address}`);
-      
-      // Wait a moment for connection to establish
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      // Mark as connected - we'll use SPP method for data transmission
-      this.isConnected = true;
-      this.deviceAddress = device.address;
-      console.log('Bluetooth connection established');
-      
-    } catch (error) {
-      console.error('Failed to connect to Bluetooth device:', error);
-      throw error;
-    }
+    const addr = await this.resolveAddress(deviceIdentifier || this.deviceAddress);
+    this.deviceAddress = addr;
+    await this.ensurePaired(addr); // optional: bluetoothctl connect
+    await this.connectRFCOMM(addr); // opens /dev/rfcomm0 on the right channel
   }
 
-  /**
-   * Send message via Bluetooth
-   */
   async sendMessage(message: string): Promise<void> {
-    if (!this.isConnected) {
-      console.warn('Bluetooth not connected. Skipping message:', message);
-      return;
-    }
-
-    console.log(`Sending via Bluetooth:`, message);
-    
-    try {
-      // Use alternative method: send via bluetoothctl or system approach
-      await this.sendViaSPP(message);
-    } catch (error) {
-      console.error('Error sending Bluetooth message:', error);
-    }
+    if (this.rfcommFd == null) throw new Error('RFCOMM not connected');
+    const line = message.endsWith('\n') ? message : message + '\n';
+    await new Promise<void>((res, rej) =>
+      fs.write(this.rfcommFd!, Buffer.from(line, 'utf8'), (e) => (e ? rej(e) : res())),
+    );
   }
 
-  /**
-   * Alternative method using a simple TCP-like approach over Bluetooth
-   * This method assumes the mobile device is running a Bluetooth server
-   */
-  async sendViaSPP(message: string): Promise<void> {
-    if (!this.isConnected || !this.deviceAddress) {
-      console.warn('Bluetooth not connected or no device address available');
-      return;
-    }
-
-    try {
-      // Use sdptool to find available services on the device
-      const { stdout } = await execAsync(`sdptool browse ${this.deviceAddress}`);
-      console.log('Available Bluetooth services:', stdout);
-      
-      // This is where you would implement SPP (Serial Port Profile) communication
-      // For now, we'll log the message
-      console.log(`Would send via SPP to ${this.deviceAddress}:`, message);
-      console.log('Message sent successfully via Bluetooth SPP');
-      
-    } catch (error) {
-      console.error('Error sending via SPP:', error);
-      // Fallback to basic logging
-      console.log('Bluetooth message (fallback):', message);
-    }
-  }
-
-  /**
-   * Close Bluetooth connection
-   */
   async closeConnection(): Promise<void> {
-    try {
-      if (this.rfcommChannel) {
-        await execAsync('sudo rfcomm release rfcomm0').catch(() => {});
-      }
-      
-      if (this.deviceAddress) {
-        await execAsync(`bluetoothctl disconnect ${this.deviceAddress}`).catch(() => {});
-      }
-      
-      this.isConnected = false;
-      this.rfcommChannel = '';
-      console.log('Bluetooth connection closed');
-    } catch (error) {
-      console.error('Error closing Bluetooth connection:', error);
+    if (this.rfcommFd != null) {
+      try { fs.closeSync(this.rfcommFd); } catch {}
+      this.rfcommFd = null;
     }
+  await new Promise<void>((resolve) => { exec('rfcomm release 0', () => resolve()); }).catch(() => {});
+    if (this.rfcommProc) { try { this.rfcommProc.kill('SIGINT'); } catch {} this.rfcommProc = null; }
   }
 
-  /**
-   * Check if Bluetooth is connected
-   */
-  get connected(): boolean {
-    return this.isConnected;
+  // --- helpers ---
+
+  private async resolveAddress(nameOrAddr: string): Promise<string> {
+    if (/^[0-9A-F:]{17}$/i.test(nameOrAddr)) return nameOrAddr;
+    const { stdout } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      exec('bluetoothctl devices Paired', (err, stdout, stderr) => err ? reject(err) : resolve({ stdout, stderr }));
+    });
+    for (const line of stdout.split('\n')) {
+      const m = line.match(/Device ([A-Fa-f0-9:]{17}) (.+)/);
+      if (m && m[2].toLowerCase().includes(nameOrAddr.toLowerCase())) return m[1];
+    }
+    throw new Error(`Paired device not found: ${nameOrAddr}`);
+  }
+
+  private async ensurePaired(addr: string) {
+    await new Promise<void>((resolve) => { exec(`bluetoothctl connect ${addr}`, () => resolve()); }).catch(() => {});
+  }
+
+  private async connectRFCOMM(addr: string): Promise<void> {
+    // First try the known RFCOMM channels from sdptool browse
+    const knownChannels = [12, 19, 26, 3, 2]; // OBEX, Phonebook, SMS, Handsfree, Headset
+    
+    console.log(`Attempting to connect to ${addr}...`);
+    
+    for (const ch of knownChannels) {
+      console.log(`Trying channel ${ch}...`);
+      await new Promise<void>((resolve) => { exec('rfcomm release 0', () => resolve()); }).catch(() => {});
+
+      const p = spawn('rfcomm', ['connect', 'rfcomm0', addr, String(ch)]);
+
+      const ok = await new Promise<boolean>((resolve) => {
+        let resolved = false;
+        const to = setTimeout(() => {
+          if (!resolved) { resolved = true; resolve(false); try { p.kill('SIGINT'); } catch {} }
+        }, 4000);
+
+        p.stdout.on('data', (d: Buffer) => {
+          const s = d.toString();
+          console.log(`Channel ${ch}: ${s.trim()}`);
+          if (!resolved && (/Connected .* on channel/.test(s) || /Connection successful/i.test(s))) { 
+            clearTimeout(to); resolved = true; resolve(true); 
+          }
+        });
+        p.stderr.on('data', (d: Buffer) => {
+          console.log(`Channel ${ch} stderr: ${d.toString().trim()}`);
+        });
+        p.on('exit', (code) => { 
+          console.log(`Channel ${ch} exited with code ${code}`);
+          if (!resolved) resolve(false); 
+        });
+      });
+
+      if (ok) {
+        this.rfcommProc = p;
+        this.rfcommFd = fs.openSync('/dev/rfcomm0', 'w');
+        console.log(`✅ RFCOMM up on channel ${ch}`);
+        return;
+      }
+    }
+    
+    console.log('All known channels failed. Make sure your Kotlin app is running and has created a BluetoothServerSocket with SPP UUID.');
+    throw new Error('Failed to open RFCOMM on any available channel. Your mobile app needs to be running first.');
   }
 }
-
-export { Bluetooth };
